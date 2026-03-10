@@ -88,12 +88,16 @@ class SpatialHeatmapOutputProcessor(fout.OutputProcessor):
         super().__init__(**kwargs)
         self.apply_smoothing = apply_smoothing
         self.smoothing_sigma = smoothing_sigma
+        self._warned_prime_token_counts = set()
 
     def __call__(self, output, frame_sizes, **kwargs):
         """Processes spatial features into heatmap labels.
 
         Args:
-            output: tensor of shape ``[B, C, H, W]`` or ``[B, N, C]``
+            output: tensor of shape ``[B, C, H, W]`` or ``[B, N, C]``. Prime
+                token counts in ``[B, N, C]`` format fall back to a ``1xN``
+                layout and emit a warning, since padding or truncation to a
+                composite count may improve PCA quality
             frame_sizes: list of ``(width, height)`` tuples
             **kwargs: additional keyword arguments
 
@@ -124,6 +128,15 @@ class SpatialHeatmapOutputProcessor(fout.OutputProcessor):
                         if N % h == 0:
                             H, W = h, N // h
                             break
+                    if H == 1 and N > 1 and N not in self._warned_prime_token_counts:
+                        logger.warning(
+                            "Prime token count %d produced a 1x%d spatial "
+                            "layout; padding or truncating tokens to a "
+                            "composite count may improve PCA quality",
+                            N,
+                            W,
+                        )
+                        self._warned_prime_token_counts.add(N)
                 spatial = spatial.reshape(H, W, C).transpose(2, 0, 1)
 
             C, H, W = spatial.shape
@@ -175,6 +188,8 @@ class CRadioV4ModelConfig(fout.TorchImageModelConfig, fozm.HasZooModel):
 
     Args:
         hf_repo ("nvidia/C-RADIOv4-H"): the HuggingFace repository name
+        hf_revision (None): an optional HuggingFace revision or commit SHA to
+            pin when loading remote model code
         output_type ("summary"): output type. Supported values are
             ``("summary", "spatial")``
         use_mixed_precision (True): whether to use bfloat16 mixed precision.
@@ -191,6 +206,7 @@ class CRadioV4ModelConfig(fout.TorchImageModelConfig, fozm.HasZooModel):
         self.hf_repo = self.parse_string(
             d, "hf_repo", default=DEFAULT_CRADIO_MODEL
         )
+        self.hf_revision = self.parse_string(d, "hf_revision", default=None)
         self.output_type = self.parse_string(d, "output_type", default="summary")
         self.use_mixed_precision = self.parse_bool(
             d, "use_mixed_precision", default=True
@@ -324,11 +340,22 @@ class CRadioV4Model(fout.TorchImageModel, fom.SupportsGetItem):
         pass
 
     def _load_model(self, config):
+        """Loads the RADIO backbone from HuggingFace.
+
+        RADIO repositories ship custom Python modules, so
+        ``trust_remote_code=True`` is required here. Callers can set
+        ``config.hf_revision`` to pin a specific revision or commit SHA when
+        they want reproducible remote code.
+        """
         from transformers import AutoModel
 
         logger.info("Loading C-RADIOv4 from HuggingFace: %s", config.hf_repo)
 
-        model = AutoModel.from_pretrained(config.hf_repo, trust_remote_code=True)
+        load_kwargs = dict(trust_remote_code=True)
+        if config.hf_revision is not None:
+            load_kwargs["revision"] = config.hf_revision
+
+        model = AutoModel.from_pretrained(config.hf_repo, **load_kwargs)
         model = model.to(self._device)
         model.eval()
         return model
@@ -336,21 +363,32 @@ class CRadioV4Model(fout.TorchImageModel, fom.SupportsGetItem):
     def _load_image_processor(self, config):
         from transformers import CLIPImageProcessor
 
-        return CLIPImageProcessor.from_pretrained(config.hf_repo)
+        load_kwargs = {}
+        if config.hf_revision is not None:
+            load_kwargs["revision"] = config.hf_revision
+
+        return CLIPImageProcessor.from_pretrained(config.hf_repo, **load_kwargs)
 
     def _check_mixed_precision_support(self):
         """Check if GPU supports bfloat16 (Ampere+)."""
         if not self._using_gpu:
             return False
 
+        cuda_exceptions = (RuntimeError, ValueError)
+        cuda_error = getattr(torch.cuda, "CudaError", None)
+        if cuda_error is not None:
+            cuda_exceptions += (cuda_error,)
+
         try:
-            if torch.cuda.is_available():
-                capability = torch.cuda.get_device_capability(self._device)
-                return capability[0] >= 8
-            return False
-        except Exception as e:
+            if not torch.cuda.is_available():
+                return False
+
+            capability = torch.cuda.get_device_capability(self._device)
+        except cuda_exceptions as e:
             logger.warning("Could not determine mixed precision support: %s", e)
             return False
+
+        return capability[0] >= 8
 
     def _predict_all(self, imgs):
         """Process a batch of images.
